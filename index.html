@@ -1037,57 +1037,69 @@
       }
     });
   }
-  // ---------- capability wiring ----------
+    // ---------- capability wiring ----------
   const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwpyJf8XzIGNR1nnjlq1RgFi5MgRC2Ds54vv3aZXOZoSTuVycq3pHYCxe6Edn0lSzsl/exec";
 
   async function init(){
-    canEdit = true; // Allows dashboard capabilities on your live GitHub page
+    canEdit = true; // Enables checkout interfaces on GitHub Pages
 
-    // 1. Fetch active logs from your Google Sheet
+    // 1. Fetch active data logs from Google Sheets
     try {
       const response = await fetch(SCRIPT_URL);
       if (response.ok) {
         const data = await response.json();
+        
+        // Re-map the Google data columns into the exact object layout the UI requires
         checkouts = data.map(function(item, index) {
           return {
             id: item.timestamp || index,
+            passId: String(item.pass || ""), // Matches the pass number to the placard UI
             employeeName: item.name,
             reason: item.reason,
-            timeOut: new Date(item.out),
-            timeBack: new Date(item.expectedback)
+            timeOut: item.out ? new Date(item.out) : new Date(),
+            timeBack: item.expectedback ? new Date(item.expectedback) : null,
+            status: item.status || "Out" // Ensures the app registers the pass as active
           };
         });
+        
         checkForNewRequests();
       } else {
         throw new Error("Sheet response not OK");
       }
     } catch(e) {
       console.error("Failed to load spreadsheet data:", e);
-      checkouts = []; // Fallback to empty list if spreadsheet is brand new
+      checkouts = []; // Safe fallback array
     }
 
-    // 2. Render layout templates
+    // 2. Render layout updates with live Google data
     render();
 
-    // 3. Hijack form submissions to route data to Google Sheets
+    // 3. Hijack form submissions to log rows down to Google
     const form = document.querySelector("form") || document.getElementById("requestForm");
     if (form) {
       form.addEventListener("submit", async function(event) {
         event.preventDefault();
         
-        // Match existing form input values
+        // Target active fields safely
         const nameInput = document.querySelector('input[placeholder*="name"]') || document.querySelector('input[type="text"]');
         const reasonInput = document.querySelector('textarea') || document.querySelector('input[placeholder*="Reason"]');
         const outInput = document.querySelector('input[type="datetime-local"]');
         const backInput = document.querySelectorAll('input[type="datetime-local"]');
-        const selectedPass = document.querySelector('.placard[data-selected="true"]') || { textContent: "349" };
+        
+        // Find which pass placard the user selected in the grid UI
+        const selectedPlacard = document.querySelector('.placard[data-selected="true"]') || document.querySelector('.placard[style*="border"]');
+        let passNum = "349"; // Default fallback
+        if (selectedPlacard) {
+          const numElement = selectedPlacard.querySelector('.num');
+          passNum = numElement ? numElement.textContent.replace("DP-", "").trim() : "349";
+        }
 
         const payload = {
-          pass: selectedPass.textContent.replace("DP-", "").trim(),
+          pass: passNum,
           name: nameInput ? nameInput.value : "",
           reason: reasonInput ? reasonInput.value : "",
-          out: outInput ? outInput.value : new Date().toISOString(),
-          expectedBack: backInput ? backInput.value : ""
+          out: outInput && outInput.value ? new Date(outInput.value).toISOString() : new Date().toISOString(),
+          expectedBack: backInput && backInput[1] && backInput[1].value ? new Date(backInput[1].value).toISOString() : ""
         };
 
         showMsg("success", "Sending...", "Piping request to your shared Google Sheet...");
@@ -1095,21 +1107,22 @@
         try {
           await fetch(SCRIPT_URL, {
             method: "POST",
-            mode: "no-cors", // Essential for Google Script endpoint clearance
+            mode: "no-cors", 
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload)
           });
           
-          showMsg("success", "Success!", "Pass requested. Updating dashboard log...");
+          showMsg("success", "Success!", "Pass requested. Updating your dashboard grid...");
           setTimeout(() => { window.location.reload(); }, 1500);
         } catch (err) {
-          showMsg("error", "Submission Failed", "Could not submit to Google Sheet. Check console logs.");
+          showMsg("error", "Submission Failed", "Could not submit to Google Sheet.");
           console.error(err);
         }
       });
     }
 
-    setInterval(render, 60000); // keep "out now" / "due soon" states fresh
+    setInterval(render, 60000); // keep "out now" states fresh
+
 
   
   }
