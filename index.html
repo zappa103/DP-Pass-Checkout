@@ -450,6 +450,13 @@
   .status-tag { font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: var(--radius); }
   .status-tag.reserved { background: var(--amber-tint); color: var(--amber-deep); }
   .status-tag.returned { background: var(--green-tint); color: var(--green); }
+  .status-tag.overdue { background: var(--rust-tint); color: var(--rust); }
+  .admin-key { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  .admin-key input {
+    font-family: inherit; font-size: 13.5px; color: var(--ink); background: var(--surface);
+    border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; width: 180px;
+  }
+  .admin-key span { font-size: 12.5px; color: var(--green); font-weight: 600; }
   .log-count { font-size: 12.5px; color: var(--ink-soft); margin-bottom: 10px; }
 
   footer.foot {
@@ -479,6 +486,7 @@
 
   <!-- ============ EMPLOYEE VIEW ============ -->
   <section id="view-request" class="view active">
+    <div class="msg error" id="loadError" style="display:none"><strong>Can't load pass status</strong><div>The Google Sheet didn't respond. Availability may be out of date — try reloading.</div></div>
     <div class="placard-grid" id="statusGrid" aria-label="Current pass status"></div>
 
     <div id="formMsg"></div>
@@ -495,6 +503,11 @@
         <div class="field">
           <label for="f-name">Your name</label>
           <input type="text" id="f-name" required autocomplete="name">
+        </div>
+        <div class="field">
+          <label for="f-email">Your email</label>
+          <input type="email" id="f-email" required autocomplete="email" placeholder="you@uga.edu">
+          <div class="field-hint">We'll email a reminder before the pass is due, and again if it's overdue.</div>
         </div>
         <div class="field">
           <label for="f-reason">Reason for needing the pass</label>
@@ -534,7 +547,12 @@
 
   <!-- ============ ADMIN VIEW ============ -->
   <section id="view-admin" class="view">
-    <div class="admin-note" id="adminRoleNote">Loading permissions…</div>
+    <div class="admin-key">
+      <input type="password" id="adminKey" placeholder="Admin key" autocomplete="current-password" aria-label="Admin key">
+      <button class="secondary" id="adminKeyBtn" type="button">Unlock</button>
+      <span id="adminKeyStatus"></span>
+    </div>
+    <div class="admin-note" id="adminRoleNote"></div>
     <button class="alert-toggle" id="alertToggle" data-on="false">🔔 Alert me here when a new request comes in</button>
 
     <div class="group-label">Needs prep — reserved or currently out</div>
@@ -570,13 +588,59 @@
 (function(){
   "use strict";
 
+  // Google Apps Script web app — stores checkouts in the Google Sheet and sends reminder emails.
+  var SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwsaxl5pmYOBfwLkpRQ2dxsocvYT3xjRdQcarghZRJQOSfXD5lq7qLDyGpRSPzALAiZ/exec";
+
   var PASSES = ["349","350","351","352","353"];
   var MAX_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-  var db = null, userCap = null, downloadsCap = null, canEdit = false;
+  var REFRESH_MS = 60 * 1000;
   var checkouts = [];
+  var loaded = false;
+  var adminKey = "";
+  var canEdit = false;
   var alertsOn = false;
   var knownIds = null;
-  var notifPermission = "default";
+
+  // ---------- API ----------
+  // text/plain keeps this a "simple" CORS request, so Apps Script can answer without a preflight.
+  function apiPost(payload){
+    return fetch(SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(payload)
+    }).then(function(r){ return r.json(); });
+  }
+
+  function loadCheckouts(){
+    return fetch(SCRIPT_URL + "?t=" + Date.now())
+      .then(function(r){ if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function(data){
+        checkouts = (Array.isArray(data) ? data : []).map(function(item){
+          var renewals = [];
+          try { renewals = JSON.parse(item.renewals || "[]") || []; } catch(e){}
+          return {
+            id: String(item.id || ""),
+            passNumber: String(item.pass || "").replace(/^DP-/i, ""),
+            employeeName: item.name || "",
+            reason: item.reason || "",
+            timeOut: item.out || "",
+            timeBack: item.expectedBack || "",
+            status: String(item.status || "reserved").toLowerCase() === "returned" ? "returned" : "reserved",
+            requestedAt: item.requestedAt || "",
+            actualReturnAt: item.actualReturnAt || "",
+            renewals: renewals
+          };
+        });
+        loaded = true;
+        document.getElementById("loadError").style.display = "none";
+        checkForNewRequests();
+        render();
+      })
+      .catch(function(err){
+        console.error("Failed to load checkouts:", err);
+        document.getElementById("loadError").style.display = "block";
+      });
+  }
 
   // ---------- tabs ----------
   var tabRequest = document.getElementById("tab-request");
@@ -587,15 +651,12 @@
   var viewLog = document.getElementById("view-log");
 
   function showTab(which){
-    tabRequest.classList.toggle("active", which === "request");
-    tabAdmin.classList.toggle("active", which === "admin");
-    tabLog.classList.toggle("active", which === "log");
-    tabRequest.setAttribute("aria-selected", String(which === "request"));
-    tabAdmin.setAttribute("aria-selected", String(which === "admin"));
-    tabLog.setAttribute("aria-selected", String(which === "log"));
-    viewRequest.classList.toggle("active", which === "request");
-    viewAdmin.classList.toggle("active", which === "admin");
-    viewLog.classList.toggle("active", which === "log");
+    [["request",tabRequest,viewRequest],["admin",tabAdmin,viewAdmin],["log",tabLog,viewLog]].forEach(function(t){
+      var on = t[0] === which;
+      t[1].classList.toggle("active", on);
+      t[1].setAttribute("aria-selected", String(on));
+      t[2].classList.toggle("active", on);
+    });
   }
   tabRequest.addEventListener("click", function(){ showTab("request"); });
   tabAdmin.addEventListener("click", function(){ showTab("admin"); render(); });
@@ -619,22 +680,20 @@
     var h = d.getHours(); var ampm = h >= 12 ? "PM" : "AM"; var h12 = h % 12; if(h12===0) h12 = 12;
     return months[d.getMonth()] + " " + d.getDate() + ", " + h12 + ":" + pad(d.getMinutes()) + " " + ampm;
   }
+  function t(iso){ return new Date(iso).getTime(); }
   function overlaps(aStart,aEnd,bStart,bEnd){ return aStart < bEnd && bStart < aEnd; }
-  function activeCheckouts(){
-    return checkouts.filter(function(c){ return c.status === "reserved"; });
-  }
+  function activeCheckouts(){ return checkouts.filter(function(c){ return c.status === "reserved"; }); }
+  // A pass that hasn't come back is still unavailable, even after its due time.
+  function effectiveEnd(c){ return Math.max(t(c.timeBack), Date.now()); }
+  function isOverdue(c){ return c.status === "reserved" && Date.now() > t(c.timeBack); }
 
   function findAvailablePass(startISO, endISO){
-    var start = new Date(startISO).getTime();
-    var end = new Date(endISO).getTime();
+    var start = t(startISO), end = t(endISO);
     var reserved = activeCheckouts();
     for (var i=0;i<PASSES.length;i++){
       var p = PASSES[i];
       var conflict = reserved.some(function(c){
-        if (c.passNumber !== p) return false;
-        var cs = new Date(c.timeOut).getTime();
-        var ce = new Date(c.timeBack).getTime();
-        return overlaps(start,end,cs,ce);
+        return c.passNumber === p && overlaps(start, end, t(c.timeOut), effectiveEnd(c));
       });
       if (!conflict) return p;
     }
@@ -642,13 +701,10 @@
   }
 
   function conflictingBookings(startISO,endISO){
-    var start = new Date(startISO).getTime();
-    var end = new Date(endISO).getTime();
+    var start = t(startISO), end = t(endISO);
     return activeCheckouts().filter(function(c){
-      var cs = new Date(c.timeOut).getTime();
-      var ce = new Date(c.timeBack).getTime();
-      return overlaps(start,end,cs,ce);
-    }).sort(function(a,b){ return new Date(a.timeBack) - new Date(b.timeBack); });
+      return overlaps(start, end, t(c.timeOut), effectiveEnd(c));
+    }).sort(function(a,b){ return t(a.timeBack) - t(b.timeBack); });
   }
 
   function escapeText(s){
@@ -664,28 +720,32 @@
     grid.innerHTML = "";
     PASSES.forEach(function(p){
       var mine = activeCheckouts().filter(function(c){ return c.passNumber === p; });
-      var current = mine.find(function(c){
-        var s = new Date(c.timeOut).getTime(), e = new Date(c.timeBack).getTime();
-        return s <= now && now <= e;
-      });
-      var next = mine.filter(function(c){ return new Date(c.timeOut).getTime() > now; })
-                     .sort(function(a,b){ return new Date(a.timeOut) - new Date(b.timeOut); })[0];
+      var current = mine.filter(function(c){ return t(c.timeOut) <= now; })
+                        .sort(function(a,b){ return t(a.timeOut) - t(b.timeOut); })[0];
+      var next = mine.filter(function(c){ return t(c.timeOut) > now; })
+                     .sort(function(a,b){ return t(a.timeOut) - t(b.timeOut); })[0];
 
       var el = document.createElement("div");
       el.className = "placard";
       var state, label, detail;
-      if (current){
+      if (!loaded){
+        state = "loading"; label = "Loading…"; detail = "";
+      } else if (current && isOverdue(current)){
+        state = "out"; label = "Overdue";
+        detail = "Was due " + fmt(current.timeBack) + " · " + current.employeeName;
+      } else if (current){
         state = "out"; label = "Out";
-        detail = "Back by " + fmt(current.timeBack) + " · " + escapeText(current.employeeName);
+        detail = "Back by " + fmt(current.timeBack) + " · " + current.employeeName;
       } else if (next){
         state = "upcoming"; label = "Reserved";
-        detail = "From " + fmt(next.timeOut) + " · " + escapeText(next.employeeName);
+        detail = "From " + fmt(next.timeOut) + " · " + next.employeeName;
       } else {
         state = "available"; label = "Available";
         detail = "Ready to take";
       }
       el.setAttribute("data-state", state);
-      el.innerHTML = '<div class="num">' + p + '</div><div class="state-label">' + label + '</div><div class="detail"></div>';
+      el.innerHTML = '<div class="num">' + p + '</div><div class="state-label"></div><div class="detail"></div>';
+      el.querySelector(".state-label").textContent = label;
       el.querySelector(".detail").textContent = detail;
       grid.appendChild(el);
     });
@@ -694,17 +754,14 @@
   // ---------- admin list ----------
   function renderAdminList(){
     var note = document.getElementById("adminRoleNote");
-    if (canEdit){
-      note.textContent = "You can confirm returns and renew passes below. Anyone with this link can submit a request.";
-    } else {
-      note.textContent = "You're viewing the shared request log. Only the pass admin can confirm a return or renew a pass.";
-    }
+    note.textContent = canEdit
+      ? "Admin mode is on. You can confirm returns and renew passes below."
+      : "You're viewing the shared request log. Enter the admin key above to confirm returns or renew passes.";
 
     var now = Date.now();
-    var active = checkouts.filter(function(c){ return c.status === "reserved"; })
-      .sort(function(a,b){ return new Date(a.timeOut) - new Date(b.timeOut); });
+    var active = activeCheckouts().sort(function(a,b){ return t(a.timeOut) - t(b.timeOut); });
     var returned = checkouts.filter(function(c){ return c.status === "returned"; })
-      .sort(function(a,b){ return new Date(b.actualReturnAt||b.timeBack) - new Date(a.actualReturnAt||a.timeBack); });
+      .sort(function(a,b){ return t(b.actualReturnAt||b.timeBack) - t(a.actualReturnAt||a.timeBack); });
 
     var listActive = document.getElementById("listActive");
     listActive.innerHTML = "";
@@ -712,12 +769,13 @@
       listActive.innerHTML = '<div class="empty">No open requests right now.</div>';
     }
     active.forEach(function(c){
-      var s = new Date(c.timeOut).getTime(), e = new Date(c.timeBack).getTime();
-      var isActive = s <= now && now <= e;
-      var dueSoon = !isActive && (s - now) <= (2*60*60*1000) && (s - now) > 0;
+      var s = t(c.timeOut);
+      var overdue = isOverdue(c);
+      var isOut = s <= now;
+      var dueSoon = !isOut && (s - now) <= (2*60*60*1000);
 
       var row = document.createElement("div");
-      row.className = "req" + (isActive ? " active" : (dueSoon ? " due-soon" : ""));
+      row.className = "req" + (isOut ? " active" : (dueSoon ? " due-soon" : ""));
       var pill = document.createElement("div");
       pill.className = "pill";
       pill.textContent = "DP-" + c.passNumber;
@@ -728,19 +786,20 @@
       var times = document.createElement("div"); times.className = "times";
       times.textContent = fmt(c.timeOut) + "  →  " + fmt(c.timeBack);
       body.appendChild(who); body.appendChild(why); body.appendChild(times);
-      if (isActive){
-        var f = document.createElement("span"); f.className = "flag active"; f.textContent = "Out now";
-        body.appendChild(document.createElement("br")); body.appendChild(f);
+      var f = null;
+      if (overdue){
+        f = document.createElement("span"); f.className = "flag active"; f.textContent = "Overdue — reminder emailed";
+      } else if (isOut){
+        f = document.createElement("span"); f.className = "flag active"; f.textContent = "Out now";
       } else if (dueSoon){
-        var f2 = document.createElement("span"); f2.className = "flag due-soon"; f2.textContent = "Needed within 2 hrs — have it ready";
-        body.appendChild(document.createElement("br")); body.appendChild(f2);
+        f = document.createElement("span"); f.className = "flag due-soon"; f.textContent = "Needed within 2 hrs — have it ready";
       }
+      if (f){ body.appendChild(document.createElement("br")); body.appendChild(f); }
       if (c.renewals && c.renewals.length){
         var rf = document.createElement("span"); rf.className = "renew-flag";
         rf.textContent = "Renewed " + c.renewals.length + "×";
         body.appendChild(rf);
       }
-
       row.appendChild(pill); row.appendChild(body);
 
       if (canEdit){
@@ -749,11 +808,11 @@
         var renewBtn = document.createElement("button");
         renewBtn.className = "renew";
         renewBtn.textContent = "Renew +7 days";
-        renewBtn.addEventListener("click", function(){ renewPass(c.id); });
+        renewBtn.addEventListener("click", function(){ adminAction("renew", c.id, renewBtn); });
         var btn = document.createElement("button");
         btn.className = "confirm";
         btn.textContent = "Confirm returned";
-        btn.addEventListener("click", function(){ confirmReturn(c.id); });
+        btn.addEventListener("click", function(){ adminAction("return", c.id, btn); });
         actions.appendChild(renewBtn);
         actions.appendChild(btn);
         row.appendChild(actions);
@@ -782,37 +841,43 @@
     });
   }
 
-  function confirmReturn(id){
-    if (!db || !canEdit) return;
-    db.doc("checkouts/" + id).update({
-      status: "returned",
-      actualReturnAt: new Date().toISOString()
-    }).catch(function(err){ console.error(err); });
+  function adminAction(action, id, btn){
+    if (!canEdit) return;
+    var original = btn.textContent;
+    btn.disabled = true; btn.textContent = "Saving…";
+    apiPost({ action: action, id: id, adminKey: adminKey }).then(function(res){
+      if (!res.ok) { alert(res.error || "That didn't work."); return; }
+      return loadCheckouts();
+    }).catch(function(err){
+      console.error(err);
+      alert("Couldn't reach the Google Sheet. Try again.");
+    }).finally(function(){ btn.disabled = false; btn.textContent = original; });
   }
 
-  function renewPass(id){
-    if (!db || !canEdit) return;
-    var c = checkouts.find(function(x){ return x.id === id; });
-    if (!c) return;
-    var newBack = new Date(new Date(c.timeBack).getTime() + MAX_DURATION_MS).toISOString();
-
-    var conflict = activeCheckouts().some(function(o){
-      if (o.id === c.id || o.passNumber !== c.passNumber) return false;
-      var os = new Date(o.timeOut).getTime(), oe = new Date(o.timeBack).getTime();
-      return overlaps(new Date(c.timeBack).getTime(), new Date(newBack).getTime(), os, oe);
-    });
-    if (conflict){
-      alert("Can't renew DP-" + c.passNumber + " — it's already booked by someone else starting before the renewed date. Confirm the return first or assign a different pass.");
-      return;
-    }
-    var renewals = (c.renewals || []).concat([{
-      at: new Date().toISOString(),
-      previousTimeBack: c.timeBack,
-      newTimeBack: newBack
-    }]);
-    db.doc("checkouts/" + id).update({ timeBack: newBack, renewals: renewals })
-      .catch(function(err){ console.error(err); });
+  // ---------- admin key ----------
+  var keyInput = document.getElementById("adminKey");
+  var keyBtn = document.getElementById("adminKeyBtn");
+  var keyStatus = document.getElementById("adminKeyStatus");
+  function setAdmin(on, key){
+    canEdit = on; adminKey = on ? key : "";
+    keyStatus.textContent = on ? "✓ Admin mode on" : "";
+    keyBtn.textContent = on ? "Sign out" : "Unlock";
+    keyInput.style.display = on ? "none" : "";
+    try { on ? localStorage.setItem("dpAdminKey", key) : localStorage.removeItem("dpAdminKey"); } catch(e){}
+    render();
   }
+  function tryKey(key){
+    keyStatus.textContent = "Checking…";
+    return apiPost({ action: "checkKey", adminKey: key }).then(function(res){
+      if (res.ok) setAdmin(true, key);
+      else { setAdmin(false); keyStatus.textContent = "Wrong key"; }
+    }).catch(function(){ keyStatus.textContent = "Couldn't check the key right now"; });
+  }
+  keyBtn.addEventListener("click", function(){
+    if (canEdit) { setAdmin(false); return; }
+    if (keyInput.value.trim()) tryKey(keyInput.value.trim());
+  });
+  keyInput.addEventListener("keydown", function(e){ if (e.key === "Enter") keyBtn.click(); });
 
   // ---------- log view ----------
   var logSearchInput = document.getElementById("logSearch");
@@ -821,14 +886,13 @@
   function renderLog(){
     var q = (logSearchInput.value || "").trim().toLowerCase();
     var rows = checkouts.slice().sort(function(a,b){
-      return new Date(b.requestedAt || b.timeOut) - new Date(a.requestedAt || a.timeOut);
+      return t(b.requestedAt || b.timeOut) - t(a.requestedAt || a.timeOut);
     });
     if (q){
       rows = rows.filter(function(c){
         return (c.employeeName||"").toLowerCase().indexOf(q) > -1 ||
                (c.reason||"").toLowerCase().indexOf(q) > -1 ||
-               ("dp-"+c.passNumber).toLowerCase().indexOf(q) > -1 ||
-               (c.passNumber||"").indexOf(q) > -1;
+               ("dp-"+c.passNumber).toLowerCase().indexOf(q) > -1;
       });
     }
     document.getElementById("logCount").textContent = rows.length + " record" + (rows.length===1?"":"s") + (q ? " matching \"" + logSearchInput.value + "\"" : " total");
@@ -838,7 +902,7 @@
     if (rows.length === 0){
       var tr = document.createElement("tr");
       var td = document.createElement("td");
-      td.colSpan = 8; td.className = "empty"; td.textContent = "No records yet.";
+      td.colSpan = 8; td.className = "empty"; td.textContent = loaded ? "No records yet." : "Loading…";
       tr.appendChild(td); tbody.appendChild(tr);
       return;
     }
@@ -857,8 +921,9 @@
       tr.appendChild(cell(fmt(c.timeBack)));
       var statusTd = document.createElement("td");
       var tag = document.createElement("span");
-      tag.className = "status-tag " + c.status;
-      tag.textContent = c.status === "returned" ? "Returned" : "Reserved";
+      var overdue = isOverdue(c);
+      tag.className = "status-tag " + (overdue ? "overdue" : c.status);
+      tag.textContent = c.status === "returned" ? "Returned" : (overdue ? "Overdue" : "Reserved");
       statusTd.appendChild(tag);
       tr.appendChild(statusTd);
       tr.appendChild(cell(c.renewals && c.renewals.length ? String(c.renewals.length) + "×" : "—"));
@@ -869,14 +934,12 @@
 
   document.getElementById("logDownload").addEventListener("click", function(){
     var rows = checkouts.slice().sort(function(a,b){
-      return new Date(a.requestedAt || a.timeOut) - new Date(b.requestedAt || b.timeOut);
+      return t(a.requestedAt || a.timeOut) - t(b.requestedAt || b.timeOut);
     });
     var header = ["Pass","Name","Reason","Time Out","Expected Back","Status","Renewals","Actual Return","Requested At"];
     function esc(v){
       v = (v===undefined || v===null) ? "" : String(v);
-      if (v.indexOf(",") > -1 || v.indexOf('"') > -1 || v.indexOf("\n") > -1){
-        v = '"' + v.replace(/"/g,'""') + '"';
-      }
+      if (/[",\n]/.test(v)) v = '"' + v.replace(/"/g,'""') + '"';
       return v;
     }
     var lines = [header.map(esc).join(",")];
@@ -886,30 +949,13 @@
         c.status, (c.renewals ? c.renewals.length : 0), c.actualReturnAt || "", c.requestedAt || ""
       ].map(esc).join(","));
     });
-    var csv = lines.join("\n");
-
-    if (downloadsCap && downloadsCap.save){
-      downloadsCap.save({ filename: "dp-pass-checkout-log.csv", data: csv }).catch(function(err){
-        console.error(err);
-        fallbackDownload(csv);
-      });
-    } else {
-      fallbackDownload(csv);
-    }
+    var blob = new Blob([lines.join("\n")], {type: "text/csv"});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url; a.download = "dp-pass-checkout-log.csv";
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   });
-
-  function fallbackDownload(csv){
-    try {
-      var blob = new Blob([csv], {type: "text/csv"});
-      var url = URL.createObjectURL(blob);
-      var a = document.createElement("a");
-      a.href = url; a.download = "dp-pass-checkout-log.csv";
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } catch(e){
-      alert("Couldn't start the download in this view. Try the Log tab from a regular browser tab.");
-    }
-  }
 
   function render(){
     renderStatusGrid();
@@ -926,12 +972,13 @@
     e.preventDefault();
     formMsg.innerHTML = "";
     var name = document.getElementById("f-name").value.trim();
+    var email = document.getElementById("f-email").value.trim();
     var reason = document.getElementById("f-reason").value.trim();
     var outVal = document.getElementById("f-out").value;
     var backVal = document.getElementById("f-back").value;
     var rulesChecked = document.getElementById("f-rules").checked;
 
-    if (!name || !reason || !outVal || !backVal){
+    if (!name || !email || !reason || !outVal || !backVal){
       showMsg("error", "Missing details", "Fill in every field before requesting a pass.");
       return;
     }
@@ -941,22 +988,16 @@
     }
     var outISO = new Date(outVal).toISOString();
     var backISO = new Date(backVal).toISOString();
-    if (new Date(backISO) <= new Date(outISO)){
+    if (t(backISO) <= t(outISO)){
       showMsg("error", "Check your times", "Expected time back has to be after the time out.");
       return;
     }
-    if (new Date(backISO).getTime() - new Date(outISO).getTime() > MAX_DURATION_MS){
+    if (t(backISO) - t(outISO) > MAX_DURATION_MS){
       showMsg("error", "That's more than 7 days",
         "Passes can only be checked out for up to a week at a time. Request up to 7 days now, and have a pass admin renew it from the Admin dashboard if you still need it after that.");
       return;
     }
-    if (!db){
-      showMsg("error", "Can't save right now", "This page can't reach shared storage at the moment. Try reloading.");
-      return;
-    }
-
-    var assigned = findAvailablePass(outISO, backISO);
-    if (!assigned){
+    if (loaded && !findAvailablePass(outISO, backISO)){
       var conflicts = conflictingBookings(outISO, backISO);
       var soonestFree = conflicts.length ? fmt(conflicts[0].timeBack) : "later";
       showMsg("error", "No passes available for that window",
@@ -967,27 +1008,27 @@
 
     submitBtn.disabled = true;
     submitBtn.textContent = "Requesting…";
-    db.collection("checkouts").add({
-      passNumber: assigned,
-      employeeName: name,
-      reason: reason,
-      timeOut: outISO,
-      timeBack: backISO,
-      status: "reserved",
-      requestedAt: new Date().toISOString(),
-      rulesAcknowledgedAt: new Date().toISOString(),
-      renewals: []
-    }).then(function(){
-      showMsg("success", "Pass DP-" + assigned + " reserved",
-        "You're set for " + fmt(outISO) + " through " + fmt(backISO) + ". Pick it up from the front desk at your time out. Remember: max 7 days per checkout — ask to have it renewed if you need it longer.");
-      form.reset();
-    }).catch(function(err){
-      console.error(err);
-      showMsg("error", "Couldn't save the request", "Something went wrong writing to shared storage. Please try again.");
-    }).finally(function(){
-      submitBtn.disabled = false;
-      submitBtn.textContent = "Request pass";
-    });
+    // The Google Sheet assigns the pass, so two people can't grab the same one at once.
+    apiPost({ action: "create", name: name, email: email, reason: reason, out: outISO, expectedBack: backISO })
+      .then(function(res){
+        if (!res.ok){
+          showMsg("error", "Couldn't reserve a pass", res.error || "Please try again.");
+          return;
+        }
+        showMsg("success", "Pass DP-" + res.pass + " reserved",
+          "You're set for " + fmt(outISO) + " through " + fmt(backISO) + ". A confirmation was emailed to " + email +
+          ", and you'll get a reminder before it's due. Pick it up from the front desk at your time out.");
+        form.reset();
+        return loadCheckouts();
+      })
+      .catch(function(err){
+        console.error(err);
+        showMsg("error", "Couldn't save the request", "Something went wrong reaching the Google Sheet. Please try again.");
+      })
+      .finally(function(){
+        submitBtn.disabled = false;
+        submitBtn.textContent = "Request pass";
+      });
   });
 
   function showMsg(kind, title, body){
@@ -1007,14 +1048,13 @@
     }
     if (!alertsOn){
       Notification.requestPermission().then(function(perm){
-        notifPermission = perm;
         if (perm === "granted"){
           alertsOn = true;
           alertToggle.setAttribute("data-on", "true");
           alertToggle.textContent = "🔔 Alerts on — new requests will notify you while this tab is open";
           knownIds = new Set(checkouts.map(function(c){ return c.id; }));
         } else {
-          alert("Notifications are blocked. You can still watch this dashboard — it updates live.");
+          alert("Notifications are blocked. You can still watch this dashboard — it refreshes every minute.");
         }
       });
     } else {
@@ -1030,104 +1070,19 @@
       if (!knownIds.has(c.id)){
         knownIds.add(c.id);
         try {
-          new Notification("New pass request — DP will be assigned", {
+          new Notification("New pass request — DP-" + c.passNumber, {
             body: c.employeeName + ": " + fmt(c.timeOut) + " → " + fmt(c.timeBack)
           });
         } catch(e){ /* ignore */ }
       }
     });
   }
-    // ---------- capability wiring ----------
-  const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwpyJf8XzIGNR1nnjlq1RgFi5MgRC2Ds54vv3aZXOZoSTuVycq3pHYCxe6Edn0lSzsl/exec";
 
-  async function init(){
-    canEdit = true; // Enables checkout interfaces on GitHub Pages
-
-    // 1. Fetch active data logs from Google Sheets
-    try {
-      const response = await fetch(SCRIPT_URL);
-      if (response.ok) {
-        const data = await response.json();
-        
-        // Re-map the Google data columns into the exact object layout the UI requires
-        checkouts = data.map(function(item, index) {
-          return {
-            id: item.timestamp || index,
-            passId: String(item.pass || ""), // Matches the pass number to the placard UI
-            employeeName: item.name,
-            reason: item.reason,
-            timeOut: item.out ? new Date(item.out) : new Date(),
-            timeBack: item.expectedback ? new Date(item.expectedback) : null,
-            status: item.status || "Out" // Ensures the app registers the pass as active
-          };
-        });
-        
-        checkForNewRequests();
-      } else {
-        throw new Error("Sheet response not OK");
-      }
-    } catch(e) {
-      console.error("Failed to load spreadsheet data:", e);
-      checkouts = []; // Safe fallback array
-    }
-
-    // 2. Render layout updates with live Google data
-    render();
-
-    // 3. Hijack form submissions to log rows down to Google
-    const form = document.querySelector("form") || document.getElementById("requestForm");
-    if (form) {
-      form.addEventListener("submit", async function(event) {
-        event.preventDefault();
-        
-        // Target active fields safely
-        const nameInput = document.querySelector('input[placeholder*="name"]') || document.querySelector('input[type="text"]');
-        const reasonInput = document.querySelector('textarea') || document.querySelector('input[placeholder*="Reason"]');
-        const outInput = document.querySelector('input[type="datetime-local"]');
-        const backInput = document.querySelectorAll('input[type="datetime-local"]');
-        
-        // Find which pass placard the user selected in the grid UI
-        const selectedPlacard = document.querySelector('.placard[data-selected="true"]') || document.querySelector('.placard[style*="border"]');
-        let passNum = "349"; // Default fallback
-        if (selectedPlacard) {
-          const numElement = selectedPlacard.querySelector('.num');
-          passNum = numElement ? numElement.textContent.replace("DP-", "").trim() : "349";
-        }
-
-        const payload = {
-          pass: passNum,
-          name: nameInput ? nameInput.value : "",
-          reason: reasonInput ? reasonInput.value : "",
-          out: outInput && outInput.value ? new Date(outInput.value).toISOString() : new Date().toISOString(),
-          expectedBack: backInput && backInput[1] && backInput[1].value ? new Date(backInput[1].value).toISOString() : ""
-        };
-
-        showMsg("success", "Sending...", "Piping request to your shared Google Sheet...");
-
-        try {
-          await fetch(SCRIPT_URL, {
-            method: "POST",
-            mode: "no-cors", 
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-          });
-          
-          showMsg("success", "Success!", "Pass requested. Updating your dashboard grid...");
-          setTimeout(() => { window.location.reload(); }, 1500);
-        } catch (err) {
-          showMsg("error", "Submission Failed", "Could not submit to Google Sheet.");
-          console.error(err);
-        }
-      });
-    }
-
-    setInterval(render, 60000); // keep "out now" states fresh
-
-
-  
-  }
-
-  init();
+  // ---------- start ----------
+  render();
+  loadCheckouts();
+  try { var saved = localStorage.getItem("dpAdminKey"); if (saved) tryKey(saved); } catch(e){}
+  setInterval(loadCheckouts, REFRESH_MS);
 })();
 </script>
 </body>
