@@ -157,7 +157,8 @@
   .tag.soon { background: var(--warn-soft); color: var(--warn); }
   .tag.later { background: var(--bg); color: var(--muted); }
   .tag.ok { background: var(--ok-soft); color: var(--ok); }
-  .item-actions { display: flex; gap: 6px; flex-wrap: wrap; flex-basis: 100%; }
+  .item-actions { display: flex; gap: 6px; flex-wrap: wrap; flex-basis: 100%; align-items: center; }
+  .days-select { font: inherit; font-size: 13px; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
   .empty { color: var(--muted); font-size: 14px; padding: 6px 0; }
 
   .log-tools { display: flex; gap: 8px; margin-bottom: 12px; }
@@ -273,8 +274,8 @@
     <div class="card unlock" id="unlockCard">
       <h2>Admin sign in</h2>
       <p>Enter the admin key to see reservations and the log.</p>
-      <form class="unlock-row" id="unlockForm">
-        <input type="password" id="adminKey" placeholder="Admin key" autocomplete="current-password" aria-label="Admin key">
+      <form class="unlock-row" id="unlockForm" autocomplete="off">
+        <input type="password" id="adminKey" name="dp-admin-unlock" placeholder="Admin key" autocomplete="off" data-lpignore="true" data-1p-ignore aria-label="Admin key">
         <button class="btn" type="submit">Unlock</button>
       </form>
       <div class="error" id="unlockError" hidden></div>
@@ -467,7 +468,8 @@
 
   function setAdmin(key){
     adminKey = key || "";
-    try { key ? localStorage.setItem("dpAdminKey", key) : localStorage.removeItem("dpAdminKey"); } catch(e){}
+    // Remembered only until this browser tab is closed, so a shared computer doesn't stay signed in.
+    try { key ? sessionStorage.setItem("dpAdminKey", key) : sessionStorage.removeItem("dpAdminKey"); localStorage.removeItem("dpAdminKey"); } catch(e){}
     $("unlockCard").hidden = !!key;
     $("adminBody").hidden = !key;
     if (key) loadRows();
@@ -501,9 +503,11 @@
     }).catch(function(err){ console.error(err); });
   }
 
-  function adminAction(action, id, btn){
+  function adminAction(action, id, btn, extra){
     var label = btn.textContent; btn.disabled = true; btn.textContent = "Saving…";
-    apiPost({ action: action, id: id, adminKey: adminKey }).then(function(res){
+    var payload = { action: action, id: id, adminKey: adminKey };
+    if (extra) for (var k in extra) payload[k] = extra[k];
+    apiPost(payload).then(function(res){
       if (!res.ok) alert(res.error || "That didn't work.");
       return Promise.all([loadRows(), loadAvailability()]);
     }).catch(function(){ alert("Couldn't reach the Google Sheet. Try again."); })
@@ -533,8 +537,13 @@
       if (renewals.length) body.appendChild(el("span", "tag later", "Renewed " + renewals.length + "×"));
       item.appendChild(body);
       var actions = el("div", "item-actions");
-      var renew = el("button", "btn-sm renew", "Renew +7 days");
-      renew.addEventListener("click", function(){ adminAction("renew", r.id, renew); });
+      var days = el("select", "days-select");
+      days.setAttribute("aria-label", "Days to extend");
+      for (var d = 1; d <= 7; d++){ var o = el("option", null, d + (d === 1 ? " day" : " days")); o.value = d; days.appendChild(o); }
+      days.value = "7";
+      var renew = el("button", "btn-sm renew", "Extend");
+      renew.addEventListener("click", function(){ adminAction("renew", r.id, renew, { days: Number(days.value) }); });
+      actions.appendChild(days);
       var back = el("button", "btn-sm good", "Mark returned");
       back.addEventListener("click", function(){ adminAction("return", r.id, back); });
       actions.appendChild(renew); actions.appendChild(back);
@@ -596,7 +605,7 @@
   });
 
   // ---------- start ----------
-  try { var saved = localStorage.getItem("dpAdminKey"); if (saved) setAdmin(saved); } catch(e){}
+  try { localStorage.removeItem("dpAdminKey"); var saved = sessionStorage.getItem("dpAdminKey"); if (saved) setAdmin(saved); } catch(e){}
   route();
   loadAvailability();
   setInterval(function(){ loadAvailability(); if (adminKey && !$("adminView").hidden) loadRows(); }, REFRESH_MS);
